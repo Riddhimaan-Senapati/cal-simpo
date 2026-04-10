@@ -2,70 +2,71 @@
 
 ## Overview
 
-You are implementing three preference optimization methods — **DPO**, **Cal-DPO**, and **SimPO** — for controlled sentiment generation on the IMDb dataset. The goal is to train GPT-2 Small (124M) to generate positive movie review completions, then compare the methods on oracle reward score, perplexity, and training dynamics. This follows the controlled evaluation setup from Cal-DPO (Xiao et al., 2024, Table 4) and extends it with SimPO (Meng et al., 2024). The original paper uses GPT-2 Large (774M); we use GPT-2 Small for computational feasibility on CPU/limited-GPU hardware. The relative trends between methods should still hold.
+You are implementing three preference optimization methods — **DPO**, **Cal-DPO**, and **SimPO** — for controlled sentiment generation on the IMDb dataset. The goal is to train GPT-2 Large (774M) to generate positive movie review completions, then compare the methods on oracle reward score, perplexity, and training dynamics. This follows the controlled evaluation setup from Cal-DPO (Xiao et al., 2024, Table 4) and extends it with SimPO (Meng et al., 2024).
 
-All code should be runnable on a CPU-only machine or a single consumer GPU. Training on CPU with GPT-2 Small should take roughly 1–2 hours per method.
+All code is in a single Jupyter notebook (`cal_simpo_imdb.ipynb`) designed for a **Colab T4 GPU** (16 GB VRAM). The `src/` Python scripts are superseded by the notebook.
 
 ---
 
 ## Implementation Status
 
-**Code is fully implemented** in `src/`. Run the complete pipeline with:
+**Three notebooks, each run as a separate Colab session.** All outputs are saved to Google Drive so they persist across sessions.
 
-```bash
-pip install -r requirements.txt
-cd src
-python run_pipeline.py            # full pipeline (all steps, all methods)
-python run_pipeline.py --steps 5 --method dpo   # single method only
+| Notebook | What it does | Run |
+|---|---|---|
+| `01_setup.ipynb` | Reward model, SFT, preference data | Once |
+| `02_train.ipynb` | Train one method (set `METHOD` at top) | 3× (dpo / caldpo / simpo) |
+| `03_eval_plots.ipynb` | Evaluation + Figures 1–3 | Once (after all 3 methods trained) |
+
+### Training a method
+
+Open `02_train.ipynb`, set `METHOD = 'dpo'` (or `'caldpo'` / `'simpo'`) in the first code cell, then run all cells. The trained checkpoint is saved to Drive **and** downloaded as a zip at the end.
+
+### Output layout (under `MyDrive/cal-simpo-outputs/`)
+
+```
+reward_model/                  GPT-2 Large classifier checkpoint
+sft_model/                     GPT-2 Large SFT checkpoint
+pref_data/                     train.json, val.json (500 pairs)
+checkpoints/<method>/final/    best trained policy (load_best_model_at_end=True)
+results/                       *_log.json (trl log_history), eval_results.json
+figures/                       fig1_dynamics.png, fig2_performance.png, fig3_loss.png
 ```
 
-### File layout
+### Preventing Colab idle disconnect
 
-```
-src/
-  utils.py               shared constants, tokenize_pair, compute_logprobs, compute_oracle_reward
-  step1_reward_model.py  fine-tune GPT2ForSequenceClassification on IMDb (oracle reward model)
-  step2_sft.py           CLM fine-tune GPT-2 on positive reviews (π_ref / SFT baseline)
-  step3_pref_data.py     generate 500 preference pairs from SFT model; 90/10 train/val split
-  step4_ref_logprobs.py  cache π_ref log-probs for all pairs (run once; only policy in memory during training)
-  step5_train.py         shared training loop for DPO / Cal-DPO / SimPO (--method flag)
-  step6_evaluate.py      oracle reward, perplexity (frozen GPT-2), reward accuracy
-  step7_plot.py          Figures 1–4 saved to outputs/figures/
-  run_pipeline.py        master runner; supports --steps and --method flags
-outputs/                 created automatically
-  reward_model/          saved classifier checkpoint
-  sft_model/             saved SFT checkpoint
-  preference_data/       train.json, val.json
-  ref_logprobs/          cached reference log-probs (JSON)
-  checkpoints/<method>/  step_N/ and final/ subdirectories
-  results/               <method>_training_log.json, evaluation_results.json
-  figures/               fig1–fig4 PNG files
+Paste this in the browser console (`F12` → Console) to click reconnect every 60 s:
+```javascript
+function keep(){document.querySelector("colab-connect-button").click()}
+setInterval(keep, 60000)
 ```
 
 ### Chosen hyperparameters
 
 | Setting | Value |
 |---|---|
+| Base model | `gpt2-large` (774 M) |
 | DPO β | 0.001 |
 | Cal-DPO β | 0.001 |
 | SimPO β / γ | 2.0 / 1.0 |
 | Optimizer | RMSprop, lr=5e-6 |
-| Effective batch | 32 (micro-batch 8, grad accum 4) |
+| Effective batch | 32 (micro-batch 4, grad accum 8) |
 | Epochs | 5 |
 | Linear warmup | 30 steps |
 | Sequence length | 192 tokens (32 prompt + 128 response + buffer) |
 | Preference pairs | 500 prompts → 450 train / 50 val |
-| Oracle eval (during training) | 50 prompts every 50 gradient steps |
+| Eval frequency | every 50 gradient steps (trl built-in) |
 | Final eval prompts | 200 (held-out, different seed) |
 | Seed | 42 |
 
 ### Implementation notes
 
-- **Cal-DPO loss** follows Algorithm 1 in the paper exactly: no β inside the sigmoid, no 0.5 weight on the calibration term. The Cal-DPO repo applies `0.5 * Cal_loss`; we do not.
-- **Chosen + rejected** are concatenated in the batch dimension for a single forward pass per gradient step.
-- **Reference log-probs** are pre-computed in step 4 and loaded as tensors during training — only the policy model occupies memory during the training loop.
-- **Perplexity** is evaluated with the original pretrained `gpt2` checkpoint (never fine-tuned), matching the paper's setup.
-- Training logs (loss, val rewards, margin, reward accuracy, oracle reward) are written to JSON after every 10 gradient steps so runs can be inspected or resumed.
+- **Cal-DPO loss** follows Algorithm 1 exactly: no β inside the sigmoid, calibration targets are ±1/(2β). Implemented by subclassing `DPOTrainer` and overriding `dpo_loss()`.
+- **trl handles** tokenisation, the training loop, gradient accumulation, and logging of `rewards/chosen`, `rewards/rejected`, `rewards/margins` at every eval step.
+- **Reference log-probs** for DPO/Cal-DPO: trl keeps the frozen `ref_model` in memory alongside the policy. Both fit in T4 16 GB at fp16 (~1.5 GB each + ~6 GB Adam states).
+- **SimPO** uses `CPOTrainer(loss_type='simpo', cpo_alpha=0)` — no reference model needed.
+- **Perplexity** is evaluated with the original pretrained `gpt2` (small, never fine-tuned), matching the paper's setup.
+- Training logs are saved via `trainer.state.log_history` → JSON after each method completes.
 
 ---
 
@@ -341,26 +342,19 @@ For reference, here is a suggested outline for the final paper:
 
 ---
 
-## Compute Tips for CPU / Limited Hardware
+## Compute Requirements (Colab T4 GPU)
 
-- **Model size**: GPT-2 Small is ~500MB in FP32. Two copies (policy + reference) fit comfortably in 4GB RAM. With pre-computed reference log-probs, you only need one copy during training.
-- **Caching reference log-probs**: This is the single most important optimization. Run the reference model once over all training pairs, save the log-probs as a tensor file. Then during training you only load the policy model. This also makes SimPO vs. DPO/Cal-DPO comparisons fairer.
-- **Training speed**: Expect ~2-5 seconds per training step on a modern CPU (depends on batch size and sequence length). With ~1000 steps per epoch, that's roughly 30-90 minutes per training run.
-- **Reduce evaluation cost**: Generating completions for oracle reward evaluation is the slowest part on CPU. Do intermediate evaluations on only 50 prompts every 200 steps. Full 500-prompt evaluation only at the end.
-- **Gradient accumulation**: If batch size 32 causes memory issues, use micro-batch of 8 with 4 accumulation steps.
-- **Save frequently**: Save checkpoints and training logs every 200 steps in case of crashes or interruptions.
-- **Optional GPU acceleration**: If you get access to any GPU (even a Colab T4), use it for the data generation and reward model steps, which involve many forward passes. The preference optimization training itself is the fastest part.
+- **GPU**: T4 (16 GB VRAM). GPT-2 Large is ~1.5 GB in fp16; two copies + Adam states ≈ 10 GB total during DPO training.
+- **fp16**: enabled automatically when CUDA is available (`fp16=(DEVICE == 'cuda')`).
+- **To reduce runtime**: lower `num_train_epochs` (3 instead of 5) or `NUM_PREF` (250 instead of 500) at the top of the config cell.
 
-### Actual runtime profile (CPU, current implementation)
+### Estimated runtime on Colab T4
 
-| Step | Bottleneck | Estimated time |
-|---|---|---|
-| Step 1 (reward model) | 5k examples × 3 epochs | ~30–60 min |
-| Step 2 (SFT) | 5k reviews × 3 epochs | ~30–60 min |
-| Step 3 (pref data) | 1000 completions at 128 tokens | ~30–60 min |
-| Step 4 (ref log-probs) | 2 forward passes × 500 pairs | ~5–10 min |
-| Step 5 (training, per method) | ~140 gradient steps | ~15–30 min |
-| Step 6 (evaluation) | 200 completions × 4 models | ~30–60 min |
-| **Total** | | **~3–5 hours** |
-
-To cut time: reduce `NUM_TRAIN` in steps 1–2, `NUM_PROMPTS` in step 3, or `N_EVAL_PROMPTS` in step 6 — all are constants at the top of each script.
+| Step | Estimated time |
+|---|---|
+| Step 1 (reward model, 5k × 3 epochs) | ~20–30 min |
+| Step 2 (SFT, 5k × 3 epochs) | ~20–30 min |
+| Step 3 (500 pairs, 1000 generations) | ~15–25 min |
+| Step 4a–c (training, per method, 5 epochs) | ~20–40 min each |
+| Step 5 (evaluation, 200 prompts × 4 models) | ~20–30 min |
+| **Total** | **~2.5–4 hours** |

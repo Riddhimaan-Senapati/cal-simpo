@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__context7__resolve-library-id",
+      "mcp__context7__query-docs",
+      "Bash(rm -f cal_simpo_imdb.ipynb src/utils.py src/step1_reward_model.py src/step2_sft.py src/step3_pref_data.py src/step4_ref_logprobs.py src/step5_train.py src/step6_evaluate.py src/step7_plot.py src/run_pipeline.py src/requirements.txt)",
+      "Bash(rmdir src:*)",
+      "Bash(python -c ':*)"
+    ]
+  }
+}
